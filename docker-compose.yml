@@ -1,0 +1,54 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: vuln-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: sqli_service
+      POSTGRES_USER: dvwa
+      POSTGRES_PASSWORD: dvwa123
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./docker/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dvwa -d sqli_service"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  sqli-service:
+    build:
+      context: ./sqli-service
+    container_name: sqli-service
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      SERVER_PORT: 8080
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: sqli_service
+      DB_USERNAME: dvwa
+      DB_PASSWORD: dvwa123
+    ports:
+      - "8080:8080"
+
+  gateway-service:
+    build:
+      context: ./gateway-service
+    container_name: gateway-service
+    restart: unless-stopped
+    depends_on:
+      sqli-service:
+        condition: service_started
+    environment:
+      SERVER_PORT: 8081
+      SQLI_SERVICE_URI: http://sqli-service:8080
+    ports:
+      - "8082:8081"
+
+volumes:
+  postgres_data:

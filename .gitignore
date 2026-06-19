@@ -1,0 +1,39 @@
+# OS / Editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.iml
+
+# Logs
+*.log
+logs/
+
+# Java / Maven
+target/
+**/target/
+.mvn/wrapper/maven-wrapper.jar
+
+# Build outputs
+out/
+build/
+dist/
+
+# Env / Secrets
+.env
+.env.*
+!.env.example
+*.local
+
+# Docker / Runtime
+docker-data/
+tmp/
+*.pid
+
+# Test / Coverage
+coverage/
+.coverage
+
+# Misc
+*.swp
+*.swo
