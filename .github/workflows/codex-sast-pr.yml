@@ -1,22 +1,42 @@
-name: Codex Security PR Scan
+name: Codex Security Java Scan
+
+run-name: >-
+  Codex Security — ${{
+    github.event_name == 'workflow_dispatch' && format('manual {0}', github.ref_name) ||
+    github.event_name == 'pull_request' && format('PR #{0}', github.event.pull_request.number) ||
+    format('push {0}', github.ref_name)
+  }}
 
 on:
+  # PR açıldığında veya PR'a yeni commit pushlandığında çalışır.
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
 
+  # Korunan/ana branch'lere doğrudan commit pushlandığında çalışır.
+  # Repository'nizde farklı ana branch adları varsa listeyi düzenleyin.
+  push:
+    branches:
+      - main
+      - master
+      - develop
+
+  # Actions ekranındaki "Run workflow" butonuyla elle çalıştırılır.
   workflow_dispatch:
     inputs:
       pr_number:
-        description: "Taranacak GitHub PR numarası"
-        required: true
+        description: "Opsiyonel PR numarası; boşsa seçilen branch taranır"
+        required: false
+        type: string
+      base_ref:
+        description: "Opsiyonel başlangıç branch/commit'i; boşsa önceki commit kullanılır"
+        required: false
         type: string
 
-# Her PR güncellemesinde eski taramayı iptal et.
+# Aynı commit için push ve PR olayı birlikte oluşursa mükerrer taramayı engelle.
 concurrency:
-  group: codex-security-${{ github.event.pull_request.number || inputs.pr_number || github.ref_name }}
+  group: codex-security-${{ github.event.pull_request.head.sha || github.sha }}
   cancel-in-progress: true
 
-# Varsayılan olarak hiçbir izin verme; izinleri job bazında aç.
 permissions: {}
 
 jobs:
@@ -25,83 +45,170 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
+    # Fork PR'larında repository secret'ları kullanılmaz.
+    if: >-
+      ${{
+        github.event_name != 'pull_request' ||
+        (
+          !github.event.pull_request.draft &&
+          github.event.pull_request.head.repo.full_name == github.repository
+        )
+      }}
+
     outputs:
-      pr_number: ${{ steps.pr.outputs.number }}
+      pr_number: ${{ steps.context.outputs.pr_number }}
+      artifact_name: ${{ steps.context.outputs.artifact_name }}
 
     permissions:
       contents: read
       pull-requests: read
 
     steps:
-      - name: Resolve PR metadata
-        id: pr
+      - name: Resolve scan context
+        id: context
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           EVENT_NAME: ${{ github.event_name }}
           EVENT_PR_NUMBER: ${{ github.event.pull_request.number }}
+          EVENT_PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          EVENT_PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          EVENT_PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+          PUSH_HEAD_SHA: ${{ github.sha }}
           MANUAL_PR_NUMBER: ${{ inputs.pr_number }}
+          MANUAL_BASE_REF: ${{ inputs.base_ref }}
         run: |
           set -euo pipefail
 
-          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
-            PR_NUMBER="$MANUAL_PR_NUMBER"
-          else
+          PR_NUMBER=""
+          BASE_SPEC=""
+          HEAD_SPEC=""
+          CHECKOUT_REF=""
+
+          if [ "$EVENT_NAME" = "pull_request" ]; then
             PR_NUMBER="$EVENT_PR_NUMBER"
-          fi
+            BASE_SPEC="$EVENT_PR_BASE_SHA"
+            HEAD_SPEC="$EVENT_PR_HEAD_SHA"
+            CHECKOUT_REF="$EVENT_PR_HEAD_SHA"
 
-          if ! [[ "$PR_NUMBER" =~ ^[0-9]+$ ]]; then
-            echo "Invalid PR number: $PR_NUMBER"
+            if [ "$EVENT_PR_HEAD_REPO" != "$GITHUB_REPOSITORY" ]; then
+              echo "Fork PR'ları repository secret'ı gerektirdiği için taranmıyor."
+              exit 1
+            fi
+
+          elif [ "$EVENT_NAME" = "push" ]; then
+            BASE_SPEC="$PUSH_BEFORE_SHA"
+            HEAD_SPEC="$PUSH_HEAD_SHA"
+            CHECKOUT_REF="$PUSH_HEAD_SHA"
+
+            # Push edilen commit açık bir PR'a aitse raporu o PR'a da yaz.
+            PR_NUMBER="$(
+              gh api \
+                -H "Accept: application/vnd.github+json" \
+                "repos/${GITHUB_REPOSITORY}/commits/${PUSH_HEAD_SHA}/pulls" \
+                --jq '[.[] | select(.state == "open")][0].number // empty' \
+                2>/dev/null || true
+            )"
+
+          elif [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            if [ -n "${MANUAL_PR_NUMBER:-}" ]; then
+              if ! [[ "$MANUAL_PR_NUMBER" =~ ^[0-9]+$ ]]; then
+                echo "Geçersiz PR numarası: $MANUAL_PR_NUMBER"
+                exit 1
+              fi
+
+              gh api \
+                -H "Accept: application/vnd.github+json" \
+                "repos/${GITHUB_REPOSITORY}/pulls/${MANUAL_PR_NUMBER}" \
+                > "$RUNNER_TEMP/pr.json"
+
+              PR_NUMBER="$MANUAL_PR_NUMBER"
+              BASE_SPEC="$(jq -r '.base.sha' "$RUNNER_TEMP/pr.json")"
+              HEAD_SPEC="$(jq -r '.head.sha' "$RUNNER_TEMP/pr.json")"
+              CHECKOUT_REF="$HEAD_SPEC"
+              HEAD_REPO="$(jq -r '.head.repo.full_name // ""' "$RUNNER_TEMP/pr.json")"
+              PR_STATE="$(jq -r '.state' "$RUNNER_TEMP/pr.json")"
+
+              if [ "$PR_STATE" != "open" ]; then
+                echo "PR #$PR_NUMBER açık değil."
+                exit 1
+              fi
+
+              if [ "$HEAD_REPO" != "$GITHUB_REPOSITORY" ]; then
+                echo "Fork PR'ları repository secret'ı gerektirdiği için taranmıyor."
+                exit 1
+              fi
+            else
+              # Actions ekranında seçilen branch/commit taranır.
+              HEAD_SPEC="$GITHUB_SHA"
+              CHECKOUT_REF="$GITHUB_SHA"
+              BASE_SPEC="${MANUAL_BASE_REF:-}"
+
+              if [ -n "$BASE_SPEC" ] && ! [[ "$BASE_SPEC" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]]; then
+                echo "Geçersiz base_ref: $BASE_SPEC"
+                exit 1
+              fi
+            fi
+          else
+            echo "Desteklenmeyen event: $EVENT_NAME"
             exit 1
           fi
 
-          gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" > "$RUNNER_TEMP/pr.json"
-
-          BASE_REF="$(jq -r '.base.ref' "$RUNNER_TEMP/pr.json")"
-          BASE_SHA="$(jq -r '.base.sha' "$RUNNER_TEMP/pr.json")"
-          HEAD_SHA="$(jq -r '.head.sha' "$RUNNER_TEMP/pr.json")"
-          HEAD_REPO="$(jq -r '.head.repo.full_name // ""' "$RUNNER_TEMP/pr.json")"
-          IS_DRAFT="$(jq -r '.draft' "$RUNNER_TEMP/pr.json")"
-          STATE="$(jq -r '.state' "$RUNNER_TEMP/pr.json")"
-
-          if [ "$STATE" != "open" ]; then
-            echo "PR #$PR_NUMBER is not open."
-            exit 1
-          fi
-
-          if [ "$IS_DRAFT" = "true" ]; then
-            echo "PR #$PR_NUMBER is a draft; scan skipped."
-            exit 1
-          fi
-
-          # Secret'ların güvenliği için fork PR'larını çalıştırma.
-          if [ "$HEAD_REPO" != "$GITHUB_REPOSITORY" ]; then
-            echo "Fork PRs are not scanned because repository secrets are required."
-            exit 1
-          fi
+          ARTIFACT_NAME="codex-security-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
 
           {
-            echo "number=$PR_NUMBER"
-            echo "base_ref=$BASE_REF"
-            echo "base_sha=$BASE_SHA"
-            echo "head_sha=$HEAD_SHA"
+            echo "pr_number=$PR_NUMBER"
+            echo "base_spec=$BASE_SPEC"
+            echo "head_spec=$HEAD_SPEC"
+            echo "checkout_ref=$CHECKOUT_REF"
+            echo "artifact_name=$ARTIFACT_NAME"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Checkout PR merge commit
+      - name: Checkout scan target
         uses: actions/checkout@v5
         with:
-          ref: refs/pull/${{ steps.pr.outputs.number }}/merge
+          ref: ${{ steps.context.outputs.checkout_ref }}
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Fetch PR base and head revisions
+      - name: Resolve base and head revisions
+        id: revisions
+        shell: bash
         env:
-          BASE_REF: ${{ steps.pr.outputs.base_ref }}
-          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          BASE_SPEC: ${{ steps.context.outputs.base_spec }}
+          HEAD_SPEC: ${{ steps.context.outputs.head_spec }}
         run: |
           set -euo pipefail
-          git fetch --no-tags origin \
-            "$BASE_REF" \
-            "+refs/pull/$PR_NUMBER/head:refs/remotes/origin/pr/$PR_NUMBER/head"
+
+          HEAD_SHA="$(git rev-parse "${HEAD_SPEC}^{commit}")"
+          BASE_SHA=""
+
+          # Push eventindeki ilk commit için before SHA sıfır olabilir.
+          if [ -n "${BASE_SPEC:-}" ] && ! [[ "$BASE_SPEC" =~ ^0+$ ]]; then
+            if git rev-parse --verify "${BASE_SPEC}^{commit}" >/dev/null 2>&1; then
+              BASE_SHA="$(git rev-parse "${BASE_SPEC}^{commit}")"
+            elif git rev-parse --verify "origin/${BASE_SPEC}^{commit}" >/dev/null 2>&1; then
+              BASE_SHA="$(git rev-parse "origin/${BASE_SPEC}^{commit}")"
+            else
+              git fetch --no-tags origin "$BASE_SPEC"
+              BASE_SHA="$(git rev-parse 'FETCH_HEAD^{commit}')"
+            fi
+          elif git rev-parse --verify "${HEAD_SHA}^" >/dev/null 2>&1; then
+            BASE_SHA="$(git rev-parse "${HEAD_SHA}^")"
+          else
+            # Repository'nin ilk commit'i için boş Git tree'siyle karşılaştır.
+            BASE_SHA="$(git hash-object -t tree /dev/null)"
+          fi
+
+          echo "Scanning revisions:"
+          echo "  base: $BASE_SHA"
+          echo "  head: $HEAD_SHA"
+
+          {
+            echo "base_sha=$BASE_SHA"
+            echo "head_sha=$HEAD_SHA"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -109,6 +216,7 @@ jobs:
           node-version: "22"
 
       - name: Install Codex CLI and Codex Security plugin
+        shell: bash
         env:
           CODEX_CLI_VERSION: ${{ vars.CODEX_CLI_VERSION }}
         run: |
@@ -128,14 +236,19 @@ jobs:
 
       - name: Run Codex Security diff scan
         id: codex_scan
+        shell: bash
         env:
-          # Repository secret olarak tanımlayın.
           CODEX_API_KEY: ${{ secrets.CODEX_SECURITY_API_KEY }}
-          BASE_SHA: ${{ steps.pr.outputs.base_sha }}
-          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          BASE_SHA: ${{ steps.revisions.outputs.base_sha }}
+          HEAD_SHA: ${{ steps.revisions.outputs.head_sha }}
           TMPDIR: ${{ runner.temp }}
         run: |
           set -euo pipefail
+
+          if [ -z "${CODEX_API_KEY:-}" ]; then
+            echo "CODEX_SECURITY_API_KEY repository secret'ı tanımlı değil."
+            exit 1
+          fi
 
           codex exec \
             --sandbox workspace-write \
@@ -159,18 +272,21 @@ jobs:
 
       - name: Collect Codex Security artifacts
         if: always()
+        shell: bash
         env:
           SCAN_ROOT: ${{ runner.temp }}/codex-security-scans
         run: |
           set -euo pipefail
 
-          # Son oluşturulan scan-manifest.json dosyasını bul.
-          MANIFEST="$({
-            find "$SCAN_ROOT" -type f -name scan-manifest.json -printf '%T@ %p\n' 2>/dev/null || true
-          } | sort -nr | head -n 1 | cut -d' ' -f2-)"
+          MANIFEST="$(
+            {
+              find "$SCAN_ROOT" -type f -name scan-manifest.json -printf '%T@ %p\n' 2>/dev/null || true
+            } | sort -nr | head -n 1 | cut -d' ' -f2-
+          )"
 
           if [ -z "$MANIFEST" ]; then
-            echo "Codex Security scan artifacts were not created." | tee codex-security-results/error.txt
+            echo "Codex Security scan artifact'ları oluşturulamadı." \
+              | tee codex-security-results/error.txt
             exit 1
           fi
 
@@ -179,7 +295,7 @@ jobs:
 
           if [ -f codex-security-results/report.md ]; then
             {
-              echo "## Codex Security PR Scan"
+              echo "## Codex Security Java Scan"
               echo
               cat codex-security-results/report.md
             } >> "$GITHUB_STEP_SUMMARY"
@@ -189,22 +305,23 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: codex-security-pr-${{ steps.pr.outputs.number }}
+          name: ${{ steps.context.outputs.artifact_name }}
           path: codex-security-results/
           if-no-files-found: error
           retention-days: 14
 
       - name: Apply optional security gate
         if: always()
+        shell: bash
         env:
-          # Repository variable CODEX_FAIL_ON_HIGH=true yapılırsa High/Critical bulgular PR check'ini düşürür.
+          # CODEX_FAIL_ON_HIGH=true ise High/Critical bulgular check'i düşürür.
           FAIL_ON_HIGH: ${{ vars.CODEX_FAIL_ON_HIGH }}
         run: |
           set -euo pipefail
 
           FINDINGS_FILE="codex-security-results/findings.json"
           if [ ! -f "$FINDINGS_FILE" ]; then
-            echo "findings.json is missing; failing closed."
+            echo "findings.json bulunamadı; güvenli tarafta kalınarak job başarısız yapılıyor."
             exit 1
           fi
 
@@ -223,19 +340,20 @@ jobs:
           echo "High/Critical finding count: $BLOCKING_COUNT"
 
           if [ "${FAIL_ON_HIGH,,}" = "true" ] && [ "$BLOCKING_COUNT" -gt 0 ]; then
-            echo "Blocking PR because CODEX_FAIL_ON_HIGH=true."
+            echo "CODEX_FAIL_ON_HIGH=true olduğu için workflow durduruldu."
             exit 1
           fi
 
   publish-pr-comment:
-    name: Publish Codex Security report
+    name: Publish Codex Security report to PR
     needs: codex-security-scan
     runs-on: ubuntu-latest
 
-    # Gate başarısız olsa bile artifact oluşturulduysa raporu PR'a yaz.
+    # PR olayı, PR numarasıyla manuel çalışma veya açık PR'a bağlı push için yorum yaz.
     if: >-
       ${{
         always() &&
+        needs.codex-security-scan.outputs.pr_number != '' &&
         needs.codex-security-scan.result != 'skipped' &&
         needs.codex-security-scan.result != 'cancelled'
       }}
@@ -249,7 +367,7 @@ jobs:
       - name: Download scan artifacts
         uses: actions/download-artifact@v4
         with:
-          name: codex-security-pr-${{ needs.codex-security-scan.outputs.pr_number }}
+          name: ${{ needs.codex-security-scan.outputs.artifact_name }}
           path: codex-security-results
 
       - name: Create or update PR comment
@@ -262,29 +380,29 @@ jobs:
           script: |
             const fs = require('fs');
 
-            const marker = '<!-- codex-security-pr-scan -->';
+            const marker = '<!-- codex-security-java-scan -->';
             const reportPath = process.env.REPORT_PATH;
 
             let report = fs.existsSync(reportPath)
               ? fs.readFileSync(reportPath, 'utf8')
-              : 'Codex Security did not produce a readable report.';
+              : 'Codex Security okunabilir bir rapor oluşturamadı.';
 
-            // GitHub yorum boyutu sınırının altında kal.
             const maxReportLength = 60000;
             if (report.length > maxReportLength) {
               report = report.slice(0, maxReportLength) +
-                '\n\n_Report truncated. Download the workflow artifact for the complete result._';
+                '\n\n_Rapor kısaltıldı. Tam sonuç için workflow artifact dosyasını indirin._';
             }
 
-            const body = `${marker}\n## Codex Security PR Scan\n\n${report}\n\n` +
+            const body = `${marker}\n## Codex Security Java Scan\n\n${report}\n\n` +
               `_Workflow run: ${context.runId}_`;
 
+            const issueNumber = Number(process.env.PR_NUMBER);
             const comments = await github.paginate(
               github.rest.issues.listComments,
               {
                 owner: context.repo.owner,
                 repo: context.repo.repo,
-                issue_number: Number(process.env.PR_NUMBER),
+                issue_number: issueNumber,
                 per_page: 100,
               }
             );
@@ -304,7 +422,7 @@ jobs:
               await github.rest.issues.createComment({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
-                issue_number: Number(process.env.PR_NUMBER),
+                issue_number: issueNumber,
                 body,
               });
             }
