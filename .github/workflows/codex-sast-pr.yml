@@ -53,19 +53,26 @@ jobs:
       contents: read
       pull-requests: read
 
-    env:
-      # Plugin kurulumu ve tarama aynı Codex ortamını kullanmalıdır.
-      CODEX_HOME: ${{ runner.temp }}/codex-home
-
-      # Codex Security çıktıları bunun altında
-      # codex-security-scans/<repo>/<scan-id>/ dizinine yazılır.
-      TMPDIR: ${{ runner.temp }}/codex-security
-
     outputs:
       pr_number: ${{ steps.context.outputs.pr_number }}
       artifact_name: ${{ steps.context.outputs.artifact_name }}
 
     steps:
+      - name: Initialize Codex environment
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          CODEX_HOME_PATH="$RUNNER_TEMP/codex-home"
+          CODEX_TMP_PATH="$RUNNER_TEMP/codex-security"
+
+          mkdir -p "$CODEX_HOME_PATH" "$CODEX_TMP_PATH"
+
+          {
+            echo "CODEX_HOME=$CODEX_HOME_PATH"
+            echo "TMPDIR=$CODEX_TMP_PATH"
+          } >> "$GITHUB_ENV"
+
       - name: Resolve scan context
         id: context
         shell: bash
