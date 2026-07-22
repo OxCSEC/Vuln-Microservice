@@ -4,9 +4,16 @@ on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
 
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "Taranacak GitHub PR numarası"
+        required: true
+        type: string
+
 # Her PR güncellemesinde eski taramayı iptal et.
 concurrency:
-  group: codex-security-${{ github.event.pull_request.number }}
+  group: codex-security-${{ github.event.pull_request.number || inputs.pr_number || github.ref_name }}
   cancel-in-progress: true
 
 # Varsayılan olarak hiçbir izin verme; izinleri job bazında aç.
@@ -18,29 +25,78 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
-    # Secret'ların güvenli kalması için fork PR'larını burada çalıştırmıyoruz.
-    # Fork PR'ları için pull_request_target + untrusted checkout kullanmayın.
-    if: >-
-      ${{
-        !github.event.pull_request.draft &&
-        github.event.pull_request.head.repo.full_name == github.repository
-      }}
+    outputs:
+      pr_number: ${{ steps.pr.outputs.number }}
 
     permissions:
       contents: read
+      pull-requests: read
 
     steps:
+      - name: Resolve PR metadata
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_PR_NUMBER: ${{ github.event.pull_request.number }}
+          MANUAL_PR_NUMBER: ${{ inputs.pr_number }}
+        run: |
+          set -euo pipefail
+
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            PR_NUMBER="$MANUAL_PR_NUMBER"
+          else
+            PR_NUMBER="$EVENT_PR_NUMBER"
+          fi
+
+          if ! [[ "$PR_NUMBER" =~ ^[0-9]+$ ]]; then
+            echo "Invalid PR number: $PR_NUMBER"
+            exit 1
+          fi
+
+          gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" > "$RUNNER_TEMP/pr.json"
+
+          BASE_REF="$(jq -r '.base.ref' "$RUNNER_TEMP/pr.json")"
+          BASE_SHA="$(jq -r '.base.sha' "$RUNNER_TEMP/pr.json")"
+          HEAD_SHA="$(jq -r '.head.sha' "$RUNNER_TEMP/pr.json")"
+          HEAD_REPO="$(jq -r '.head.repo.full_name // ""' "$RUNNER_TEMP/pr.json")"
+          IS_DRAFT="$(jq -r '.draft' "$RUNNER_TEMP/pr.json")"
+          STATE="$(jq -r '.state' "$RUNNER_TEMP/pr.json")"
+
+          if [ "$STATE" != "open" ]; then
+            echo "PR #$PR_NUMBER is not open."
+            exit 1
+          fi
+
+          if [ "$IS_DRAFT" = "true" ]; then
+            echo "PR #$PR_NUMBER is a draft; scan skipped."
+            exit 1
+          fi
+
+          # Secret'ların güvenliği için fork PR'larını çalıştırma.
+          if [ "$HEAD_REPO" != "$GITHUB_REPOSITORY" ]; then
+            echo "Fork PRs are not scanned because repository secrets are required."
+            exit 1
+          fi
+
+          {
+            echo "number=$PR_NUMBER"
+            echo "base_ref=$BASE_REF"
+            echo "base_sha=$BASE_SHA"
+            echo "head_sha=$HEAD_SHA"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Checkout PR merge commit
         uses: actions/checkout@v5
         with:
-          ref: refs/pull/${{ github.event.pull_request.number }}/merge
+          ref: refs/pull/${{ steps.pr.outputs.number }}/merge
           fetch-depth: 0
           persist-credentials: false
 
       - name: Fetch PR base and head revisions
         env:
-          BASE_REF: ${{ github.event.pull_request.base.ref }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BASE_REF: ${{ steps.pr.outputs.base_ref }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
         run: |
           set -euo pipefail
           git fetch --no-tags origin \
@@ -75,8 +131,8 @@ jobs:
         env:
           # Repository secret olarak tanımlayın.
           CODEX_API_KEY: ${{ secrets.CODEX_SECURITY_API_KEY }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_SHA: ${{ steps.pr.outputs.base_sha }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
           TMPDIR: ${{ runner.temp }}
         run: |
           set -euo pipefail
@@ -133,7 +189,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: codex-security-pr-${{ github.event.pull_request.number }}
+          name: codex-security-pr-${{ steps.pr.outputs.number }}
           path: codex-security-results/
           if-no-files-found: error
           retention-days: 14
@@ -193,13 +249,14 @@ jobs:
       - name: Download scan artifacts
         uses: actions/download-artifact@v4
         with:
-          name: codex-security-pr-${{ github.event.pull_request.number }}
+          name: codex-security-pr-${{ needs.codex-security-scan.outputs.pr_number }}
           path: codex-security-results
 
       - name: Create or update PR comment
         uses: actions/github-script@v7
         env:
           REPORT_PATH: codex-security-results/report.md
+          PR_NUMBER: ${{ needs.codex-security-scan.outputs.pr_number }}
         with:
           github-token: ${{ github.token }}
           script: |
@@ -227,7 +284,7 @@ jobs:
               {
                 owner: context.repo.owner,
                 repo: context.repo.repo,
-                issue_number: context.issue.number,
+                issue_number: Number(process.env.PR_NUMBER),
                 per_page: 100,
               }
             );
@@ -247,7 +304,7 @@ jobs:
               await github.rest.issues.createComment({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
-                issue_number: context.issue.number,
+                issue_number: Number(process.env.PR_NUMBER),
                 body,
               });
             }
